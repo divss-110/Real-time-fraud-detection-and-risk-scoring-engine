@@ -1,0 +1,66 @@
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  pipeline:
+    build: .
+    image: fraud-engine:latest
+    command: >
+      sh -c "python data/synthetic_generator.py &&
+             python -m src.models.train --trials 25 &&
+             python -m src.features.materialize --config feature_store.redis.yaml &&
+             python data/synthetic_generator.py --drift &&
+             python -m src.monitoring.drift"
+    environment:
+      FEAST_CONFIG: feature_store.redis.yaml
+      MLFLOW_TRACKING_URI: file:///app/mlruns
+    volumes:
+      - ./data/raw:/app/data/raw
+      - ./data/processed:/app/data/processed
+      - ./models:/app/models
+      - ./reports:/app/reports
+      - ./mlruns:/app/mlruns
+      - ./src/features/feast_repo/data:/app/src/features/feast_repo/data
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  api:
+    image: fraud-engine:latest
+    environment:
+      FEATURE_BACKEND: feast
+      FEAST_CONFIG: feature_store.redis.yaml
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data/processed:/app/data/processed:ro
+      - ./models:/app/models:ro
+      - ./src/features/feast_repo/data:/app/src/features/feast_repo/data
+    depends_on:
+      redis:
+        condition: service_healthy
+      pipeline:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  mlflow:
+    image: fraud-engine:latest
+    command: mlflow ui --backend-store-uri file:///app/mlruns --host 0.0.0.0 --port 5000
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./mlruns:/app/mlruns
+    depends_on:
+      pipeline:
+        condition: service_completed_successfully
